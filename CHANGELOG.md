@@ -15,3 +15,4 @@ All notable changes to this project will be documented in this file.  The format
 ### Changed
 * Global Equity relative strength excludes meaningless ACWI-versus-ACWI scoring.
 * Thai Equity macro scoring is neutral.
+* Dashboard data requests execute across historical bars so their contexts are available when the realtime table renders.

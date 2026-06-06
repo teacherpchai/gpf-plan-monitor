@@ -209,6 +209,7 @@ f_note(string planName, float total, float confidenceScore, bool concentrationWa
 
 // === Dashboard ===
 f_dashboard_row(table dashboard, int row, string planName, string primary, string benchmark, bool neutralRs) =>
+    // Requests must execute on historical bars so their contexts are available on realtime bars.
     [weeklyClose, weeklyEma, _, _] = f_weekly(primary)
     [monthlyClose, monthlyEma] = f_monthly(primary)
     bool weeklyAvailable = f_available(weeklyClose) and f_available(weeklyEma)
@@ -225,23 +226,24 @@ f_dashboard_row(table dashboard, int row, string planName, string primary, strin
     string weeklyText = weeklyAvailable ? weeklyPass ? "Strong" : "Weak" : "Missing"
     string monthlyText = monthlyAvailable ? monthlyPass ? "Strong" : "Weak" : "Missing"
     string rsText = neutralRs ? "N/A" : rsAvailable ? rsPass ? "Up" : "Down" : "Missing"
-    table.cell(dashboard, 0, row, planName)
-    table.cell(dashboard, 1, row, weeklyText, text_color = f_result_color(weeklyText))
-    table.cell(dashboard, 2, row, monthlyText, text_color = f_result_color(monthlyText))
-    table.cell(dashboard, 3, row, rsText, text_color = rsText == "N/A" ? color.gray : f_result_color(rsText))
-    table.cell(dashboard, 4, row, f_score_text(score), text_color = na(score) ? color.red : color.blue)
-    table.cell(dashboard, 5, row, f_dashboard_status(score), text_color = f_result_color(f_dashboard_status(score)))
+    if barstate.islast
+        table.cell(dashboard, 0, row, planName)
+        table.cell(dashboard, 1, row, weeklyText, text_color = f_result_color(weeklyText))
+        table.cell(dashboard, 2, row, monthlyText, text_color = f_result_color(monthlyText))
+        table.cell(dashboard, 3, row, rsText, text_color = rsText == "N/A" ? color.gray : f_result_color(rsText))
+        table.cell(dashboard, 4, row, f_score_text(score), text_color = na(score) ? color.red : color.blue)
+        table.cell(dashboard, 5, row, f_dashboard_status(score), text_color = f_result_color(f_dashboard_status(score)))
 
 f_draw_dashboard() =>
     var table dashboard = table.new(position.top_right, 6, 5, border_color = color.gray, border_width = 1)
+    f_dashboard_row(dashboard, 1, "Gold", goldPrimary, globalPrimary, false)
+    f_dashboard_row(dashboard, 2, "Global", globalPrimary, globalPrimary, true)
+    f_dashboard_row(dashboard, 3, "Thai", thaiPrimary, globalPrimary, false)
+    f_dashboard_row(dashboard, 4, "Shariah", shariahPrimary, globalPrimary, false)
     if barstate.islast
         array<string> headers = array.from("Plan", "Weekly", "Monthly", "RS", "Score", "Status")
         for [column, header] in headers
             table.cell(dashboard, column, 0, header, text_color = color.white, bgcolor = color.black)
-        f_dashboard_row(dashboard, 1, "Gold", goldPrimary, globalPrimary, false)
-        f_dashboard_row(dashboard, 2, "Global", globalPrimary, globalPrimary, true)
-        f_dashboard_row(dashboard, 3, "Thai", thaiPrimary, globalPrimary, false)
-        f_dashboard_row(dashboard, 4, "Shariah", shariahPrimary, globalPrimary, false)
 
 // === Detail modes ===
 f_draw_detail(string planName, array<string> proxies, array<string> rsPrimaries, array<string> rsSecondaries, string benchmark, bool secondaryOnlyRs, string macroType, float proxyFit, float expectedTests, bool capConfidence, bool thaiBreadth, bool shariahMode) =>
