@@ -1,0 +1,344 @@
+// GPF Plan Monitor v0.1
+// Market-proxy regime monitor. It does not use GPF NAV data or issue investment advice.
+
+//@version=6
+indicator("GPF Plan Monitor v0.1", overlay = false, dynamic_requests = true)
+
+// === Constants ===
+const int WEEKLY_EMA_LEN = 40
+const int MONTHLY_EMA_LEN = 10
+const int RS_SMA_LEN = 12
+const int MACRO_SMA_LEN = 26
+const int DRAWDOWN_LEN = 52
+
+const float TREND_MAX = 40.0
+const float RS_MAX = 30.0
+const float MACRO_MAX = 20.0
+const float RISK_MAX = 10.0
+
+const float STATUS_CONFIRMED = 75.0
+const float STATUS_MIXED = 50.0
+const float CONF_HIGH = 75.0
+const float CONF_MEDIUM = 50.0
+
+// === Inputs ===
+string mode = input.string("Dashboard", "Mode", options = ["Dashboard", "GoldDetail", "GlobalEquityDetail", "ThaiEquityDetail", "ShariahDetail"])
+
+string goldPrimary = input.symbol("OANDA:XAUUSD", "Gold Primary", group = "Gold")
+string goldSecondary1 = input.symbol("COMEX:GC1!", "Gold Secondary 1", group = "Gold")
+string goldSecondary2 = input.symbol("AMEX:GLD", "Gold Secondary 2", group = "Gold")
+
+string globalPrimary = input.symbol("AMEX:ACWI", "Global Primary", group = "Global Equity")
+string globalSPY = input.symbol("AMEX:SPY", "SPY", group = "Global Equity")
+string globalQQQ = input.symbol("NASDAQ:QQQ", "QQQ", group = "Global Equity")
+string globalVEA = input.symbol("AMEX:VEA", "VEA", group = "Global Equity")
+string globalVWO = input.symbol("AMEX:VWO", "VWO", group = "Global Equity")
+
+string thaiPrimary = input.symbol("SET:SET50", "Thai Primary", group = "Thai Equity")
+string thaiSET = input.symbol("SET:SET", "SET", group = "Thai Equity")
+string thai1 = input.symbol("SET:DELTA", "Thai Proxy 1", group = "Thai Equity")
+string thai2 = input.symbol("SET:PTT", "Thai Proxy 2", group = "Thai Equity")
+string thai3 = input.symbol("SET:KBANK", "Thai Proxy 3", group = "Thai Equity")
+string thai4 = input.symbol("SET:ADVANC", "Thai Proxy 4", group = "Thai Equity")
+string thai5 = input.symbol("SET:KTB", "Thai Proxy 5", group = "Thai Equity")
+string thai6 = input.symbol("SET:SCB", "Thai Proxy 6", group = "Thai Equity")
+string thai7 = input.symbol("SET:BBL", "Thai Proxy 7", group = "Thai Equity")
+string thai8 = input.symbol("SET:GULF", "Thai Proxy 8", group = "Thai Equity")
+string thai9 = input.symbol("SET:PTTEP", "Thai Proxy 9", group = "Thai Equity")
+string thai10 = input.symbol("SET:CPN", "Thai Proxy 10", group = "Thai Equity")
+
+string shariahPrimary = input.symbol("AMEX:SPUS", "Shariah Primary", group = "Shariah")
+string shariahHLAL = input.symbol("NASDAQ:HLAL", "Shariah Secondary", group = "Shariah")
+string shariahSPYBenchmark = input.symbol("AMEX:SPY", "Shariah SPY Benchmark", group = "Shariah")
+
+string macroDXY = input.symbol("TVC:DXY", "DXY", group = "Macro")
+string macroUS10Y = input.symbol("TVC:US10Y", "US 10Y", group = "Macro")
+string macroUSDTHB = input.symbol("FX_IDC:USDTHB", "USDTHB", group = "Macro")
+
+// === Confirmed higher-timeframe requests ===
+// The [1] offset plus lookahead_on returns only the prior completed HTF bar.
+f_weekly(string symbol) =>
+    request.security(symbol, "W", [close[1], ta.ema(close, WEEKLY_EMA_LEN)[1], ta.sma(close, MACRO_SMA_LEN)[1], ta.highest(close, DRAWDOWN_LEN)[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+
+f_monthly(string symbol) =>
+    request.security(symbol, "M", [close[1], ta.ema(close, MONTHLY_EMA_LEN)[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+
+// Evaluate proxy/benchmark ratio and its SMA inside the weekly context.
+f_rs_expression(string benchmark) =>
+    float benchmarkClose = request.security(benchmark, "W", close, ignore_invalid_symbol = true)
+    float ratio = close / benchmarkClose
+    [ratio[1], ta.sma(ratio, RS_SMA_LEN)[1]]
+
+f_relative_strength(string proxy, string benchmark) =>
+    request.security(proxy, "W", f_rs_expression(benchmark), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+
+f_available(float value) =>
+    not na(value)
+
+f_status(float score) =>
+    na(score) ? "Missing" : score >= STATUS_CONFIRMED ? "Confirmed" : score >= STATUS_MIXED ? "Mixed" : "Not Confirmed"
+
+f_dashboard_status(float score) =>
+    na(score) ? "Missing" : score >= 67 ? "Strong" : score >= 34 ? "Neutral" : "Weak"
+
+f_confidence_label(float score, bool capAtMedium) =>
+    na(score) ? "Low" : score >= CONF_HIGH and not capAtMedium ? "High" : score >= CONF_MEDIUM ? "Medium" : "Low"
+
+f_result_text(float score, float maxScore) =>
+    na(score) ? "Missing" : score >= maxScore * 0.75 ? "Pass" : score > 0 ? "Partial" : "Fail"
+
+f_result_color(string result) =>
+    result == "Pass" or result == "Strong" or result == "Confirmed" or result == "Up" or result == "High" ? color.green :
+      result == "Partial" or result == "Neutral" or result == "Mixed" or result == "Medium" ? color.orange : color.red
+
+f_score_text(float score) =>
+    na(score) ? "Missing" : str.tostring(score, "#.0")
+
+// Returns score, available test count, passing test count, and timeframe-alignment count.
+f_trend_scores(array<string> proxies) =>
+    float passCount = 0.0
+    float availableCount = 0.0
+    float alignedCount = 0.0
+    float alignedAvailable = 0.0
+    for symbol in proxies
+        [weeklyClose, weeklyEma, _, _] = f_weekly(symbol)
+        [monthlyClose, monthlyEma] = f_monthly(symbol)
+        bool weeklyAvailable = f_available(weeklyClose) and f_available(weeklyEma)
+        bool monthlyAvailable = f_available(monthlyClose) and f_available(monthlyEma)
+        bool weeklyPass = weeklyAvailable and weeklyClose > weeklyEma
+        bool monthlyPass = monthlyAvailable and monthlyClose > monthlyEma
+        if weeklyAvailable
+            availableCount += 1
+            passCount += weeklyPass ? 1 : 0
+        if monthlyAvailable
+            availableCount += 1
+            passCount += monthlyPass ? 1 : 0
+        if weeklyAvailable and monthlyAvailable
+            alignedAvailable += 1
+            alignedCount += weeklyPass == monthlyPass ? 1 : 0
+    float score = availableCount > 0 ? passCount / availableCount * TREND_MAX : na
+    [score, availableCount, passCount, alignedCount, alignedAvailable]
+
+// Returns score, available test count, and passing test count.
+f_rs_scores(array<string> primaryProxies, array<string> secondaryProxies, string benchmark, bool secondaryOnly) =>
+    float primaryPass = 0.0
+    float primaryAvailable = 0.0
+    for symbol in primaryProxies
+        [ratio, ratioSma] = f_relative_strength(symbol, benchmark)
+        bool available = f_available(ratio) and f_available(ratioSma)
+        if available
+            primaryAvailable += 1
+            primaryPass += ratio > ratioSma ? 1 : 0
+    float secondaryPass = 0.0
+    float secondaryAvailable = 0.0
+    for symbol in secondaryProxies
+        [ratio, ratioSma] = f_relative_strength(symbol, benchmark)
+        bool available = f_available(ratio) and f_available(ratioSma)
+        if available
+            secondaryAvailable += 1
+            secondaryPass += ratio > ratioSma ? 1 : 0
+    float primaryScore = primaryAvailable > 0 ? primaryPass / primaryAvailable * 20.0 : 0.0
+    float secondaryScore = secondaryAvailable > 0 ? secondaryPass / secondaryAvailable * (secondaryOnly ? 30.0 : 10.0) : 0.0
+    float availableCount = primaryAvailable + secondaryAvailable
+    float score = availableCount > 0 ? secondaryOnly ? secondaryScore : primaryScore + secondaryScore : na
+    [score, availableCount, primaryPass + secondaryPass]
+
+// Macro plan types: Gold, Foreign, Thai, Shariah. Thai macro is neutral and receives 10/20.
+f_macro_score(string planType) =>
+    float score = 0.0
+    float availableCount = 0.0
+    float passCount = 0.0
+    if planType == "Thai"
+        score := 10.0
+    else
+        [us10yClose, _, us10ySma, _] = f_weekly(macroUS10Y)
+        [usdthbClose, _, usdthbSma, _] = f_weekly(macroUSDTHB)
+        bool usAvailable = f_available(us10yClose) and f_available(us10ySma)
+        bool fxAvailable = f_available(usdthbClose) and f_available(usdthbSma)
+        if usAvailable
+            availableCount += 1
+            bool pass = us10yClose < us10ySma
+            passCount += pass ? 1 : 0
+            score += pass ? 10 : 0
+        if planType == "Shariah"
+            [goldClose, goldEma, _, _] = f_weekly(goldPrimary)
+            bool goldAvailable = f_available(goldClose) and f_available(goldEma)
+            if goldAvailable
+                availableCount += 1
+                bool pass = goldClose > goldEma
+                passCount += pass ? 1 : 0
+                score += pass ? 5 : 0
+        else
+            [dxyClose, _, dxySma, _] = f_weekly(macroDXY)
+            bool dxyAvailable = f_available(dxyClose) and f_available(dxySma)
+            if dxyAvailable
+                availableCount += 1
+                bool pass = dxyClose < dxySma
+                passCount += pass ? 1 : 0
+                score += pass ? 5 : 0
+        if fxAvailable
+            availableCount += 1
+            bool pass = planType == "Gold" ? usdthbClose < usdthbSma : usdthbClose > usdthbSma
+            passCount += pass ? 1 : 0
+            score += pass ? 5 : 0
+    float finalScore = planType == "Thai" ? score : availableCount > 0 ? score : na
+    [finalScore, availableCount, passCount]
+
+f_risk_score(string primary) =>
+    [weeklyClose, _, _, highestClose] = f_weekly(primary)
+    bool available = f_available(weeklyClose) and f_available(highestClose) and highestClose > 0
+    float drawdown = available ? (weeklyClose - highestClose) / highestClose : na
+    float score = not available ? na : drawdown >= 0 ? 10.0 : drawdown >= -0.25 ? 5.0 : 0.0
+    [score, drawdown]
+
+// Confidence rewards complete data and agreement, including bearish agreement.
+f_confidence(float proxyFit, float passCount, float availableCount, float alignedCount, float alignedAvailable, float expectedCount, bool capAtMedium) =>
+    float signalAgreement = availableCount > 0 ? math.max(passCount, availableCount - passCount) / availableCount * 25.0 : 0.0
+    float timeframeAgreement = alignedAvailable > 0 ? alignedCount / alignedAvailable * 20.0 : 0.0
+    float completeness = expectedCount > 0 ? math.min(availableCount / expectedCount, 1.0) * 15.0 : 0.0
+    float score = proxyFit + signalAgreement + timeframeAgreement + completeness
+    float cappedScore = capAtMedium ? math.min(score, 74.0) : score
+    [cappedScore, f_confidence_label(cappedScore, capAtMedium)]
+
+f_note(string planName, float total, float confidenceScore, bool concentrationWarning, bool shariahDisagreement) =>
+    concentrationWarning ? "Warning: Thai strength is concentrated in DELTA." :
+      shariahDisagreement ? "Warning: SPUS and HLAL weekly trends disagree." :
+      na(total) ? "Important proxy data is missing." :
+      confidenceScore < 50 ? "Low evidence quality; review proxies before interpretation." :
+      planName + " evidence is " + str.lower(f_status(total)) + "."
+
+// === Dashboard ===
+f_dashboard_row(table dashboard, int row, string planName, string primary, string benchmark, bool neutralRs) =>
+    [weeklyClose, weeklyEma, _, _] = f_weekly(primary)
+    [monthlyClose, monthlyEma] = f_monthly(primary)
+    [ratio, ratioSma] = f_relative_strength(primary, benchmark)
+    bool weeklyAvailable = f_available(weeklyClose) and f_available(weeklyEma)
+    bool monthlyAvailable = f_available(monthlyClose) and f_available(monthlyEma)
+    bool rsAvailable = neutralRs or (f_available(ratio) and f_available(ratioSma))
+    bool weeklyPass = weeklyAvailable and weeklyClose > weeklyEma
+    bool monthlyPass = monthlyAvailable and monthlyClose > monthlyEma
+    bool rsPass = not neutralRs and rsAvailable and ratio > ratioSma
+    float score = weeklyAvailable and monthlyAvailable and rsAvailable ? neutralRs ? (weeklyPass ? 50 : 0) + (monthlyPass ? 50 : 0) : (weeklyPass ? 33 : 0) + (monthlyPass ? 33 : 0) + (rsPass ? 34 : 0) : na
+    string weeklyText = weeklyAvailable ? weeklyPass ? "Strong" : "Weak" : "Missing"
+    string monthlyText = monthlyAvailable ? monthlyPass ? "Strong" : "Weak" : "Missing"
+    string rsText = neutralRs ? "N/A" : rsAvailable ? rsPass ? "Up" : "Down" : "Missing"
+    table.cell(dashboard, 0, row, planName)
+    table.cell(dashboard, 1, row, weeklyText, text_color = f_result_color(weeklyText))
+    table.cell(dashboard, 2, row, monthlyText, text_color = f_result_color(monthlyText))
+    table.cell(dashboard, 3, row, rsText, text_color = rsText == "N/A" ? color.gray : f_result_color(rsText))
+    table.cell(dashboard, 4, row, f_score_text(score), text_color = na(score) ? color.red : color.blue)
+    table.cell(dashboard, 5, row, f_dashboard_status(score), text_color = f_result_color(f_dashboard_status(score)))
+
+f_draw_dashboard() =>
+    var table dashboard = table.new(position.top_right, 6, 5, border_color = color.gray, border_width = 1)
+    if barstate.islast
+        array<string> headers = array.from("Plan", "Weekly", "Monthly", "RS", "Score", "Status")
+        for [column, header] in headers
+            table.cell(dashboard, column, 0, header, text_color = color.white, bgcolor = color.black)
+        f_dashboard_row(dashboard, 1, "Gold", goldPrimary, globalPrimary, false)
+        f_dashboard_row(dashboard, 2, "Global", globalPrimary, globalPrimary, true)
+        f_dashboard_row(dashboard, 3, "Thai", thaiPrimary, globalPrimary, false)
+        f_dashboard_row(dashboard, 4, "Shariah", shariahPrimary, globalPrimary, false)
+
+// === Detail modes ===
+f_draw_detail(string planName, array<string> proxies, array<string> rsPrimaries, array<string> rsSecondaries, string benchmark, bool secondaryOnlyRs, string macroType, float proxyFit, float expectedTests, bool capConfidence, bool thaiBreadth, bool shariahMode) =>
+    [trendScore, trendAvailable, trendPass, alignedCount, alignedAvailable] = f_trend_scores(proxies)
+    [rsScore, rsAvailable, rsPass] = f_rs_scores(rsPrimaries, rsSecondaries, benchmark, secondaryOnlyRs)
+    [macroScore, macroAvailable, macroPass] = f_macro_score(macroType)
+    [riskScore, drawdown] = f_risk_score(array.get(proxies, 0))
+    float riskAvailable = na(riskScore) ? 0.0 : 1.0
+
+    bool shariahDisagreement = false
+    bool shariahSpyAvailable = false
+    bool shariahSpyPass = false
+    if shariahMode and array.size(proxies) >= 2
+        [primaryClose, primaryEma, _, _] = f_weekly(array.get(proxies, 0))
+        [secondaryClose, secondaryEma, _, _] = f_weekly(array.get(proxies, 1))
+        bool bothAvailable = f_available(primaryClose) and f_available(primaryEma) and f_available(secondaryClose) and f_available(secondaryEma)
+        shariahDisagreement := bothAvailable and (primaryClose > primaryEma) != (secondaryClose > secondaryEma)
+        if shariahDisagreement and not na(riskScore)
+            riskScore := math.max(riskScore - 5.0, 0.0)
+        [spyRatio, spyRatioSma] = f_relative_strength(shariahPrimary, shariahSPYBenchmark)
+        shariahSpyAvailable := f_available(spyRatio) and f_available(spyRatioSma)
+        shariahSpyPass := shariahSpyAvailable and spyRatio > spyRatioSma
+
+    float riskPass = na(riskScore) ? 0.0 : riskScore >= 5 ? 1.0 : 0.0
+    float total = na(trendScore) or na(rsScore) or na(macroScore) or na(riskScore) ? na : trendScore + rsScore + macroScore + riskScore
+    float allAvailable = trendAvailable + rsAvailable + macroAvailable + riskAvailable + (shariahSpyAvailable ? 1 : 0)
+    float allPass = trendPass + rsPass + macroPass + riskPass + (shariahSpyPass ? 1 : 0)
+    [confidenceScore, confidenceLabel] = f_confidence(proxyFit, allPass, allAvailable, alignedCount, alignedAvailable, expectedTests, capConfidence)
+
+    bool concentrationWarning = false
+    string breadthText = "N/A"
+    if thaiBreadth
+        float breadthPass = 0.0
+        float breadthAvailable = 0.0
+        bool deltaPass = false
+        for [index, symbol] in proxies
+            if index >= 2
+                [weeklyClose, weeklyEma, _, _] = f_weekly(symbol)
+                bool available = f_available(weeklyClose) and f_available(weeklyEma)
+                if available
+                    bool pass = weeklyClose > weeklyEma
+                    breadthAvailable += 1
+                    breadthPass += pass ? 1 : 0
+                    if index == 2
+                        deltaPass := pass
+        concentrationWarning := deltaPass and breadthPass <= 1
+        breadthText := breadthAvailable > 0 ? str.tostring(breadthPass, "#") + "/" + str.tostring(breadthAvailable, "#") + " weekly pass" : "Missing"
+
+    var table detail = table.new(position.top_right, 3, 11, border_color = color.gray, border_width = 1)
+    if barstate.islast
+        table.clear(detail, 0, 0, 2, 10)
+        table.cell(detail, 0, 0, planName + " Detail", text_color = color.white, bgcolor = color.black)
+        table.cell(detail, 1, 0, "Result", text_color = color.white, bgcolor = color.black)
+        table.cell(detail, 2, 0, "Score / Note", text_color = color.white, bgcolor = color.black)
+
+        string trendResult = f_result_text(trendScore, TREND_MAX)
+        string rsResult = f_result_text(rsScore, RS_MAX)
+        string macroResult = f_result_text(macroScore, MACRO_MAX)
+        string riskResult = f_result_text(riskScore, RISK_MAX)
+        table.cell(detail, 0, 1, "Trend")
+        table.cell(detail, 1, 1, trendResult, text_color = f_result_color(trendResult))
+        table.cell(detail, 2, 1, f_score_text(trendScore), text_color = color.blue)
+        table.cell(detail, 0, 2, "Relative Strength")
+        table.cell(detail, 1, 2, rsResult, text_color = f_result_color(rsResult))
+        table.cell(detail, 2, 2, f_score_text(rsScore), text_color = color.blue)
+        table.cell(detail, 0, 3, "Macro")
+        table.cell(detail, 1, 3, macroResult, text_color = f_result_color(macroResult))
+        table.cell(detail, 2, 3, macroType == "Thai" ? "Neutral 10.0" : f_score_text(macroScore), text_color = color.blue)
+        table.cell(detail, 0, 4, "Risk")
+        table.cell(detail, 1, 4, riskResult, text_color = f_result_color(riskResult))
+        table.cell(detail, 2, 4, na(drawdown) ? "Missing" : f_score_text(riskScore) + " | DD " + str.tostring(drawdown * 100, "#.0") + "%", text_color = color.blue)
+        table.cell(detail, 0, 5, "Total")
+        table.cell(detail, 1, 5, f_status(total), text_color = f_result_color(f_status(total)))
+        table.cell(detail, 2, 5, f_score_text(total), text_color = color.blue)
+        table.cell(detail, 0, 6, "Final Status")
+        table.cell(detail, 1, 6, f_status(total), text_color = f_result_color(f_status(total)))
+        table.cell(detail, 2, 6, "Dashboard is screening only.")
+        table.cell(detail, 0, 7, "Confidence")
+        table.cell(detail, 1, 7, confidenceLabel, text_color = f_result_color(confidenceLabel))
+        table.cell(detail, 2, 7, f_score_text(confidenceScore), text_color = color.blue)
+        table.cell(detail, 0, 8, thaiBreadth ? "Thai Breadth" : shariahMode ? "Proxy Agreement" : "Data Completeness")
+        table.cell(detail, 1, 8, thaiBreadth ? breadthText : shariahMode ? (shariahDisagreement ? "Disagree" : "Agree") + " | vs SPY " + (shariahSpyAvailable ? shariahSpyPass ? "Up" : "Down" : "Missing") : str.tostring(allAvailable, "#") + "/" + str.tostring(expectedTests, "#"))
+        table.cell(detail, 2, 8, thaiBreadth and concentrationWarning ? "Concentration warning" : shariahMode and capConfidence ? "Confidence capped at Medium" : "")
+        table.cell(detail, 0, 9, "Note")
+        table.cell(detail, 1, 9, f_note(planName, total, confidenceScore, concentrationWarning, shariahDisagreement))
+        table.cell(detail, 2, 9, "")
+        table.cell(detail, 0, 10, "Data")
+        table.cell(detail, 1, 10, allAvailable >= expectedTests ? "Complete" : "Missing")
+        table.cell(detail, 2, 10, str.tostring(allAvailable, "#") + "/" + str.tostring(expectedTests, "#") + " tests")
+
+// === Main ===
+if mode == "Dashboard"
+    f_draw_dashboard()
+else if mode == "GoldDetail"
+    f_draw_detail("Gold", array.from(goldPrimary, goldSecondary1, goldSecondary2), array.from(goldPrimary), array.from(goldSecondary1, goldSecondary2), globalPrimary, false, "Gold", 40.0, 13.0, false, false, false)
+else if mode == "GlobalEquityDetail"
+    // ACWI/ACWI is deliberately excluded. Secondary proxies carry Global RS.
+    f_draw_detail("Global", array.from(globalPrimary, globalSPY, globalQQQ, globalVEA, globalVWO), array.new<string>(), array.from(globalSPY, globalQQQ, globalVEA, globalVWO), globalPrimary, true, "Foreign", 40.0, 18.0, false, false, false)
+else if mode == "ThaiEquityDetail"
+    f_draw_detail("Thai", array.from(thaiPrimary, thaiSET, thai1, thai2, thai3, thai4, thai5, thai6, thai7, thai8, thai9, thai10), array.from(thaiPrimary), array.from(thaiSET, thai1, thai2, thai3, thai4, thai5, thai6, thai7, thai8, thai9, thai10), globalPrimary, false, "Thai", 35.0, 37.0, false, true, false)
+else
+    // ACWI is the scoring benchmark; SPY remains an override input for future expanded comparison.
+    f_draw_detail("Shariah", array.from(shariahPrimary, shariahHLAL), array.from(shariahPrimary), array.from(shariahHLAL), globalPrimary, false, "Shariah", 25.0, 11.0, true, false, true)
