@@ -211,13 +211,16 @@ f_note(string planName, float total, float confidenceScore, bool concentrationWa
 f_dashboard_row(table dashboard, int row, string planName, string primary, string benchmark, bool neutralRs) =>
     [weeklyClose, weeklyEma, _, _] = f_weekly(primary)
     [monthlyClose, monthlyEma] = f_monthly(primary)
-    [ratio, ratioSma] = f_relative_strength(primary, benchmark)
     bool weeklyAvailable = f_available(weeklyClose) and f_available(weeklyEma)
     bool monthlyAvailable = f_available(monthlyClose) and f_available(monthlyEma)
-    bool rsAvailable = neutralRs or (f_available(ratio) and f_available(ratioSma))
+    bool rsAvailable = neutralRs
     bool weeklyPass = weeklyAvailable and weeklyClose > weeklyEma
     bool monthlyPass = monthlyAvailable and monthlyClose > monthlyEma
-    bool rsPass = not neutralRs and rsAvailable and ratio > ratioSma
+    bool rsPass = false
+    if not neutralRs
+        [ratio, ratioSma] = f_relative_strength(primary, benchmark)
+        rsAvailable := f_available(ratio) and f_available(ratioSma)
+        rsPass := rsAvailable and ratio > ratioSma
     float score = weeklyAvailable and monthlyAvailable and rsAvailable ? neutralRs ? (weeklyPass ? 50 : 0) + (monthlyPass ? 50 : 0) : (weeklyPass ? 33 : 0) + (monthlyPass ? 33 : 0) + (rsPass ? 34 : 0) : na
     string weeklyText = weeklyAvailable ? weeklyPass ? "Strong" : "Weak" : "Missing"
     string monthlyText = monthlyAvailable ? monthlyPass ? "Strong" : "Weak" : "Missing"
